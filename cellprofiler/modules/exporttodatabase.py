@@ -5059,7 +5059,7 @@ class_table  = %(class_table)s
 
 check_tables = yes
     """ % (
-                locals()
+                dict((k,v.encode('ascii','backslashreplace')) if type(v) == str else (k,v) for (k,v) in locals().items())
             )
             result.append(Properties(properties_object_name, file_name, contents))
         return result
