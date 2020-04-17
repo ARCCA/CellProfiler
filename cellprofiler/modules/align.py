@@ -1,25 +1,52 @@
-'''<b>Align</b> aligns images relative to each other, for example, to correct 
-shifts in the optical path of a microscope in each channel of a multi-channel
-set of images.
-<hr>
-For two or more input images, this module determines the optimal alignment
-among them. Aligning images is useful to obtain proper measurements of the
-intensities in one channel based on objects identified in another channel,
-for example. Alignment is often needed when the microscope is not perfectly
-calibrated. It can also be useful to align images in a time-lapse series of
-images.  The module stores the amount of shift between images as a
-measurement, which can be useful for quality control purposes.
+# coding=utf-8
 
-<p>Note that the second image (and others following) is always aligned
-with respect to the first image. That is, the X/Y offsets indicate how much
-the second image needs to be shifted by to match the first.</p>
+"""
+Align
+=====
 
-<h4>Available measurements</h4>
-<ul>
-<li><i>XShift, Yshift:</i> The pixel shift in X and Y of the
-aligned image with respect to the original image.</li>
-</ul>
-'''
+**Align** aligns images relative to each other, for example, to correct
+shifts in the optical path of a microscope in each channel of a
+multi-channel set of images.
+
+For two or more input images, this module determines the optimal
+alignment among them. Aligning images is useful to obtain proper
+measurements of the intensities in one channel based on objects
+identified in another channel, for example. Alignment is often needed
+when the microscope is not perfectly calibrated. It can also be useful
+to align images in a time-lapse series of images. The module stores the
+amount of shift between images as a measurement, which can be useful for
+quality control purposes.
+
+Note that the second image (and others following) is always aligned with
+respect to the first image. That is, the X/Y offsets indicate how much
+the second image needs to be shifted by to match the first.
+
+This module does not perform warping or rotation, it simply shifts images
+in X and Y. For more complex registration tasks, you might preprocess
+images using a plugin for that purpose in FIJI/ImageJ.
+
+|
+
+============ ============ ===============
+Supports 2D? Supports 3D? Respects masks?
+============ ============ ===============
+YES          NO           YES
+============ ============ ===============
+
+
+
+Measurements made by this module
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+-  *Xshift, Yshift:* The pixel shift in X and Y of the aligned image
+   with respect to the original image.
+
+References
+^^^^^^^^^^
+
+-  Lewis JP. (1995) “Fast normalized cross-correlation.” *Vision
+   Interface*, 1-7.
+"""
 
 import numpy as np
 import scipy.ndimage as scind
@@ -28,16 +55,16 @@ from centrosome.filter import stretch
 from scipy.fftpack import fft2, ifft2
 
 import cellprofiler.image as cpi
-import cellprofiler.module as cpm
 import cellprofiler.measurement as cpmeas
+import cellprofiler.module as cpm
 import cellprofiler.setting as cps
 
-M_MUTUAL_INFORMATION = 'Mutual Information'
-M_CROSS_CORRELATION = 'Normalized Cross Correlation'
+M_MUTUAL_INFORMATION = "Mutual Information"
+M_CROSS_CORRELATION = "Normalized Cross Correlation"
 M_ALL = (M_MUTUAL_INFORMATION, M_CROSS_CORRELATION)
 
-A_SIMILARLY = 'Similarly'
-A_SEPARATELY = 'Separately'
+A_SIMILARLY = "Similarly"
+A_SEPARATELY = "Separately"
 
 C_SAME_SIZE = "Keep size"
 C_CROP = "Crop to aligned region"
@@ -50,146 +77,178 @@ MEASUREMENT_FORMAT = C_ALIGN + "_%sshift_%s"
 
 class Align(cpm.Module):
     module_name = "Align"
-    category = 'Image Processing'
+    category = "Image Processing"
     variable_revision_number = 3
 
     def create_settings(self):
         self.first_input_image = cps.ImageNameSubscriber(
-                "Select the first input image",
-                cps.NONE, doc="""
-            Specify the name of the first image to align.""")
+            "Select the first input image",
+            cps.NONE,
+            doc="""\
+Specify the name of the first image to align.""",
+        )
 
         self.first_output_image = cps.ImageNameProvider(
-                "Name the first output image",
-                "AlignedRed", doc="""
-            Enter the name of the first aligned image.""")
+            "Name the first output image",
+            "AlignedRed",
+            doc="""\
+Enter the name of the first aligned image.""",
+        )
 
         self.separator_1 = cps.Divider(line=False)
         self.second_input_image = cps.ImageNameSubscriber(
-                "Select the second input image",
-                cps.NONE, doc="""
-            Specify the name of the second image to align.""")
+            "Select the second input image",
+            cps.NONE,
+            doc="""\
+Specify the name of the second image to align.""",
+        )
 
         self.second_output_image = cps.ImageNameProvider(
-                "Name the second output image",
-                "AlignedGreen", doc="""
-            Enter the name of the second aligned image.""")
+            "Name the second output image",
+            "AlignedGreen",
+            doc="""\
+Enter the name of the second aligned image.""",
+        )
 
         self.separator_2 = cps.Divider(line=False)
         self.additional_images = []
-        self.add_button = cps.DoSomething("", "Add another image",
-                                          self.add_image)
+        self.add_button = cps.DoSomething("", "Add another image", self.add_image)
 
-        self.alignment_method = cps.Choice("Select the alignment method",
-                                           M_ALL, doc='''
-             Two options for the alignment method are available:<br>
-             <ul>
-             <li><i>%(M_MUTUAL_INFORMATION)s:</i> This more general method works well for aligning
-             images from different modalities that contain the same information, but are
-             expressed differently. However, this method performs better than %(M_CROSS_CORRELATION)s,
-             even in the same modality, if the images are not highly correlated.
-             It is iterative, and thus tends to be slower than other methods,
-             but is more likely to be correct.  Essentially, alignment is performed by measuring
-             how well one image "explains" the other. For example, a flourescent image
-             can be aligned to a brightfield image by this method since the relevant
-             features are bright in one modality where they are dim in the other. </li>
-             <li><i>%(M_CROSS_CORRELATION)s:</i> This is a good means
-             of alignment in the case of images acquired with the same modality
-             (e.g., all images to be aligned are fluorescent). It is fast, however
-             it can be highly influenced by a particular, possibly spurious, feature and
-             in turn generate anomalously large shifts. It allows for a
-             linear relationship between the intensities of the two images,
-             i.e., the relevant features in the images to be aligned all have
-             varying degrees of brightness.</li>
-             </ul>
-             <p>
-             <b>References</b>
-             <ul>
-             <li>Lewis JP. (1995) "Fast normalized cross-correlation." <i>Vision Interface</i>, 1-7.</li>
-             </ul>
-             </p>''' % globals())
+        self.alignment_method = cps.Choice(
+            "Select the alignment method",
+            M_ALL,
+            doc="""\
+Two options for the alignment method are available:
+
+-  *%(M_MUTUAL_INFORMATION)s:* This more general method works well for
+   aligning images from different modalities that contain the same
+   information, but are expressed differently. However, this method
+   performs better than %(M_CROSS_CORRELATION)s, even in the same
+   modality, if the images are not highly correlated. It is iterative,
+   and thus tends to be slower than other methods, but is more likely to
+   be correct. Essentially, alignment is performed by measuring how well
+   one image “explains” the other. For example, a fluorescent image can
+   be aligned to a brightfield image by this method since the relevant
+   features are bright in one modality where they are dim in the other.
+-  *%(M_CROSS_CORRELATION)s:* This is a good means of alignment in the
+   case of images acquired with the same modality (e.g., all images to
+   be aligned are fluorescent). It is fast, however it can be highly
+   influenced by a particular, possibly spurious, feature and in turn
+   generate anomalously large shifts. It allows for a linear
+   relationship between the intensities of the two images, i.e., the
+   relevant features in the images to be aligned all have varying
+   degrees of brightness.
+
+"""
+            % globals(),
+        )
 
         self.crop_mode = cps.Choice(
-                "Crop mode", [C_CROP, C_PAD, C_SAME_SIZE], doc="""
-            The crop mode determines how the output images are either cropped
-            or padded after alignment. The alignment phase calculates the
-            areas in each image that are found to be overlapping. In almost
-            all cases, there will be portions of some or all of the images
-            that don't overlap with any other aligned image. These portions
-            have no counterpart and will be excluded from analysis. There
-            are three choices for cropping:
-            <ul>
-            <li><i>%(C_CROP)s:</i> Crop every image to the region that overlaps
-            in all images. This makes downstream
-            analysis simpler because all of the output images
-            have authentic pixel data at all positions, however it discards
-            parts of images. Also, the output images may not be the same size
-            as the input images which may cause problems if downstream modules
-            use aligned and unaligned images (which may be of differing sizes)
-            in combination.</li>
-            <li><i>%(C_PAD)s:</i> Align every image and pad with masked black
-            pixels to make each image the same size. This results in larger
-            images, but preserves all information in each of the images. This
-            may be the best choice if images undergo an operation such as
-            smoothing that could use the information that would otherwise be
-            cropped.</li>
-            <li><i>%(C_SAME_SIZE)s:</i> Maintain the sizes of the images but
-            align them, masking the unaligned portions with black pixels.
-            <b>Align</b> aligns all images relative to the first.
-            This is a reasonable option for alignments
-            with small displacements since it maintains a consistent image
-            size which may be useful if output images from different image sets
-            will be compared against each other after processing. The
-            reference image can also be used across image sets. For example,
-            the reference image could be loaded for all image sets in a
-            group to align the entire group's images similarly, then the
-            aligned images could be combined in a module such as
-            <b>MakeProjection</b>.</li>
-            </ul>""" % globals())
+            "Crop mode",
+            [C_CROP, C_PAD, C_SAME_SIZE],
+            doc="""\
+The crop mode determines how the output images are either cropped or
+padded after alignment. The alignment phase calculates the areas in each
+image that are found to be overlapping. In almost all cases, there will
+be portions of some or all of the images that don’t overlap with any
+other aligned image. These portions have no counterpart and will be
+excluded from analysis. There are three choices for cropping:
+
+-  *%(C_CROP)s:* Crop every image to the region that overlaps in all
+   images. This makes downstream analysis simpler because all of the
+   output images have authentic pixel data at all positions, however it
+   discards parts of images. Also, the output images may not be the same
+   size as the input images which may cause problems if downstream
+   modules use aligned and unaligned images (which may be of differing
+   sizes) in combination.
+-  *%(C_PAD)s:* Align every image and pad with masked black pixels to
+   make each image the same size. This results in larger images, but
+   preserves all information in each of the images. This may be the best
+   choice if images undergo an operation such as smoothing that could
+   use the information that would otherwise be cropped.
+-  *%(C_SAME_SIZE)s:* Maintain the sizes of the images but align them,
+   masking the unaligned portions with black pixels. **Align** aligns
+   all images relative to the first. This is a reasonable option for
+   alignments with small displacements since it maintains a consistent
+   image size which may be useful if output images from different image
+   sets will be compared against each other after processing. The
+   reference image can also be used across image sets. For example, the
+   reference image could be loaded for all image sets in a group to
+   align the entire group’s images similarly, then the aligned images
+   could be combined in a module such as **MakeProjection**.
+   """
+            % globals(),
+        )
 
     def add_image(self, can_remove=True):
-        '''Add an image + associated questions and buttons'''
+        """Add an image + associated questions and buttons"""
         group = cps.SettingsGroup()
         if can_remove:
             group.append("divider", cps.Divider(line=False))
 
-        group.append("input_image_name",
-                     cps.ImageNameSubscriber(
-                             "Select the additional image",
-                             cps.NONE, doc="""
-                         Select the additional image to align?"""))
+        group.append(
+            "input_image_name",
+            cps.ImageNameSubscriber(
+                "Select the additional image",
+                cps.NONE,
+                doc="""
+ Select the additional image to align?""",
+            ),
+        )
 
-        group.append("output_image_name",
-                     cps.ImageNameProvider(
-                             "Name the output image",
-                             "AlignedBlue", doc="""
-                         Enter the name of the aligned image?"""))
+        group.append(
+            "output_image_name",
+            cps.ImageNameProvider(
+                "Name the output image",
+                "AlignedBlue",
+                doc="""
+ Enter the name of the aligned image?""",
+            ),
+        )
 
-        group.append("align_choice",
-                     cps.Choice(
-                             "Select how the alignment is to be applied",
-                             [A_SIMILARLY, A_SEPARATELY], doc="""
-                         An additional image can either be aligned similarly to the second one or
-                         a separate alignment to the first image can be calculated:
-                         <ul>
-                         <li><i>%(A_SIMILARLY)s:</i> The same alignment measurements obtained from
-                         the first two input images are applied to this additional image.</li>
-                         <li><i>%(A_SEPARATELY)s:</i> A new set of alignment measurements are
-                         calculated for this additional image using the alignment method
-                         specified with respect to the first input image.</li>
-                         </ul>""" % globals()))
+        group.append(
+            "align_choice",
+            cps.Choice(
+                "Select how the alignment is to be applied",
+                [A_SIMILARLY, A_SEPARATELY],
+                doc="""\
+An additional image can either be aligned similarly to the second one or
+a separate alignment to the first image can be calculated:
+
+-  *%(A_SIMILARLY)s:* The same alignment measurements obtained from the
+   first two input images are applied to this additional image.
+-  *%(A_SEPARATELY)s:* A new set of alignment measurements are
+   calculated for this additional image using the alignment method
+   specified with respect to the first input image.
+"""
+                % globals(),
+            ),
+        )
 
         if can_remove:
-            group.append("remover", cps.RemoveSettingButton("", "Remove above image", self.additional_images, group))
+            group.append(
+                "remover",
+                cps.RemoveSettingButton(
+                    "", "Remove above image", self.additional_images, group
+                ),
+            )
         self.additional_images.append(group)
 
     def settings(self):
         result = [self.alignment_method, self.crop_mode]
 
-        result += [self.first_input_image, self.first_output_image,
-                   self.second_input_image, self.second_output_image]
+        result += [
+            self.first_input_image,
+            self.first_output_image,
+            self.second_input_image,
+            self.second_output_image,
+        ]
         for additional in self.additional_images:
-            result += [additional.input_image_name, additional.output_image_name, additional.align_choice]
+            result += [
+                additional.input_image_name,
+                additional.output_image_name,
+                additional.align_choice,
+            ]
         return result
 
     def prepare_settings(self, setting_values):
@@ -202,8 +261,13 @@ class Align(cpm.Module):
     def visible_settings(self):
         result = [self.alignment_method, self.crop_mode]
 
-        result += [self.first_input_image, self.first_output_image, self.separator_1,
-                   self.second_input_image, self.second_output_image]
+        result += [
+            self.first_input_image,
+            self.first_output_image,
+            self.separator_1,
+            self.second_input_image,
+            self.second_output_image,
+        ]
         for additional in self.additional_images:
             result += additional.visible_settings()
         result += [self.add_button]
@@ -212,26 +276,32 @@ class Align(cpm.Module):
     def run(self, workspace):
         i_min = np.iinfo(int).max
         j_min = np.iinfo(int).max
-        off_x, off_y = self.align(workspace, self.first_input_image.value,
-                                  self.second_input_image.value)
+        off_x, off_y = self.align(
+            workspace, self.first_input_image.value, self.second_input_image.value
+        )
         names = [
             (self.first_input_image.value, self.first_output_image.value),
-            (self.second_input_image.value, self.second_output_image.value)]
+            (self.second_input_image.value, self.second_output_image.value),
+        ]
         offsets = [(0, 0), (off_y, off_x)]
 
         for additional in self.additional_images:
-            names.append((additional.input_image_name.value,
-                          additional.output_image_name.value))
+            names.append(
+                (additional.input_image_name.value, additional.output_image_name.value)
+            )
             if additional.align_choice == A_SIMILARLY:
                 a_off_x, a_off_y = off_x, off_y
             else:
-                a_off_x, a_off_y = self.align(workspace,
-                                              self.first_input_image.value,
-                                              additional.input_image_name.value)
+                a_off_x, a_off_y = self.align(
+                    workspace,
+                    self.first_input_image.value,
+                    additional.input_image_name.value,
+                )
             offsets.append((a_off_y, a_off_x))
 
-        shapes = [workspace.image_set.get_image(x).pixel_data.shape[:2]
-                  for x, _ in names]
+        shapes = [
+            workspace.image_set.get_image(x).pixel_data.shape[:2] for x, _ in names
+        ]
         offsets, shapes = self.adjust_offsets(offsets, shapes)
 
         #
@@ -239,23 +309,26 @@ class Align(cpm.Module):
         #
         for (input_name, output_name), (y, x), shape in zip(names, offsets, shapes):
             self.apply_alignment(workspace, input_name, output_name, x, y, shape)
-            for axis, value in (('X', -x), ('Y', -y)):
-                feature = (MEASUREMENT_FORMAT %
-                           (axis, output_name))
+            for axis, value in (("X", -x), ("Y", -y)):
+                feature = MEASUREMENT_FORMAT % (axis, output_name)
                 workspace.measurements.add_image_measurement(feature, value)
 
         # save data for display
-        workspace.display_data.image_info = \
-            [(input_name,
-              workspace.image_set.get_image(input_name).pixel_data,
-              output_name,
-              workspace.image_set.get_image(output_name).pixel_data,
-              x, y, shape)
-             for (input_name, output_name), (y, x), shape
-             in zip(names, offsets, shapes)]
+        workspace.display_data.image_info = [
+            (
+                input_name,
+                workspace.image_set.get_image(input_name).pixel_data,
+                output_name,
+                workspace.image_set.get_image(output_name).pixel_data,
+                x,
+                y,
+                shape,
+            )
+            for (input_name, output_name), (y, x), shape in zip(names, offsets, shapes)
+        ]
 
     def display(self, workspace, figure):
-        '''Display the overlaid images
+        """Display the overlaid images
 
         workspace - the workspace being run, with display_data holding:
             image_info - a list of lists:
@@ -265,7 +338,7 @@ class Align(cpm.Module):
                  output image data
                  x offset
                  y offset
-        '''
+        """
         image_info = workspace.display_data.image_info
         first_input_name = self.first_input_image.value
         first_output_name = self.first_output_image.value
@@ -273,44 +346,55 @@ class Align(cpm.Module):
 
         first_input_pixels = image_info[0][1]
         first_output_pixels = image_info[0][3]
-        for j, (input_name, input_pixels, output_name, output_pixels, off_x, off_y, shape) \
-                in enumerate(image_info[1:]):
-            unaligned_title = ("Unaligned images: %s and %s" %
-                               (first_input_name, input_name))
+        for (
+            j,
+            (input_name, input_pixels, output_name, output_pixels, off_x, off_y, shape),
+        ) in enumerate(image_info[1:]):
+            unaligned_title = "Unaligned images: %s and %s" % (
+                first_input_name,
+                input_name,
+            )
             #
             # Make them grayscale if needed
             #
             first_pixels, other_pixels = [
                 img if img.ndim == 2 else np.mean(img, 2)
-                for img in first_input_pixels, input_pixels]
+                for img in (first_input_pixels, input_pixels)
+            ]
             max_shape = np.maximum(first_pixels.shape, other_pixels.shape)
             img = np.zeros((max_shape[0], max_shape[1], 3))
-            img[:first_pixels.shape[0], :first_pixels.shape[1], 0] = first_pixels
-            img[:other_pixels.shape[0], :other_pixels.shape[1], 1] = other_pixels
-            figure.subplot_imshow(0, j, img, unaligned_title,
-                                  sharexy=figure.subplot(0, 0))
+            img[: first_pixels.shape[0], : first_pixels.shape[1], 0] = first_pixels
+            img[: other_pixels.shape[0], : other_pixels.shape[1], 1] = other_pixels
+            figure.subplot_imshow(
+                0, j, img, unaligned_title, sharexy=figure.subplot(0, 0)
+            )
 
-            aligned_title = ("Aligned images: %s and %s\nX offset: %d, Y offset: %d" %
-                             (first_output_name, output_name,
-                              -off_x, -off_y))
+            aligned_title = "Aligned images: %s and %s\nX offset: %d, Y offset: %d" % (
+                first_output_name,
+                output_name,
+                -off_x,
+                -off_y,
+            )
             first_pixels, other_pixels = [
                 img if img.ndim == 2 else np.mean(img, 2)
-                for img in first_output_pixels, output_pixels]
+                for img in (first_output_pixels, output_pixels)
+            ]
             max_shape = np.maximum(first_pixels.shape, other_pixels.shape)
             img = np.zeros((max_shape[0], max_shape[1], 3))
-            img[:first_pixels.shape[0], :first_pixels.shape[1], 0] = first_pixels
-            img[:other_pixels.shape[0], :other_pixels.shape[1], 1] = other_pixels
-            figure.subplot_imshow(1, j, img, aligned_title,
-                                  sharexy=figure.subplot(0, 0))
+            img[: first_pixels.shape[0], : first_pixels.shape[1], 0] = first_pixels
+            img[: other_pixels.shape[0], : other_pixels.shape[1], 1] = other_pixels
+            figure.subplot_imshow(
+                1, j, img, aligned_title, sharexy=figure.subplot(0, 0)
+            )
 
     def align(self, workspace, input1_name, input2_name):
-        '''Align the second image with the first
+        """Align the second image with the first
 
         Calculate the alignment offset that must be added to indexes in the
         first image to arrive at indexes in the second image.
 
         Returns the x,y (not i,j) offsets.
-        '''
+        """
         image1 = workspace.image_set.get_image(input1_name)
         image1_pixels = image1.pixel_data.astype(float)
         image2 = workspace.image_set.get_image(input2_name)
@@ -320,11 +404,12 @@ class Align(cpm.Module):
         else:
             image1_mask = image1.mask
             image2_mask = image2.mask
-            return self.align_mutual_information(image1_pixels, image2_pixels,
-                                                 image1_mask, image2_mask)
+            return self.align_mutual_information(
+                image1_pixels, image2_pixels, image1_mask, image2_mask
+            )
 
     def align_cross_correlation(self, pixels1, pixels2):
-        '''Align the second image with the first using max cross-correlation
+        """Align the second image with the first using max cross-correlation
 
         returns the x,y offsets to add to image1's indexes to align it with
         image2
@@ -333,7 +418,7 @@ class Align(cpm.Module):
         Cross-Correlation" by J.P. Lewis
         (http://www.idiom.com/~zilla/Papers/nvisionInterface/nip.html)
         which is frequently cited when addressing this problem.
-        '''
+        """
         #
         # TODO: Possibly use all 3 dimensions for color some day
         #
@@ -356,8 +441,7 @@ class Align(cpm.Module):
         #
         # Calculate the # of pixels at a particular point
         #
-        i, j = np.mgrid[-s[0]:s[0],
-               -s[1]:s[1]]
+        i, j = np.mgrid[-s[0] : s[0], -s[1] : s[1]]
         unit = np.abs(i * j).astype(float)
         unit[unit < 1] = 1  # keeps from dividing by zero in some places
         #
@@ -419,7 +503,7 @@ class Align(cpm.Module):
         p2_sum = np.fliplr(np.flipud(p2_sum))
         p2_mean = p2_sum / unit
         #
-        # Once we have the means for u,v, we can caluclate the
+        # Once we have the means for u,v, we can calculate the
         # variance-like parts of the equation. We have to multiply
         # the mean^2 by the # of elements being summed-over
         # to account for the mean being summed that many times.
@@ -437,8 +521,7 @@ class Align(cpm.Module):
         # deviation is less than 1/100 of the maximum. We exclude these
         # from consideration.
         #
-        corrnorm[(unit < np.product(s) / 2) &
-                 (sd < np.mean(sd) / 100)] = 0
+        corrnorm[(unit < np.product(s) / 2) & (sd < np.mean(sd) / 100)] = 0
         i, j = np.unravel_index(np.argmax(corrnorm), fshape)
         #
         # Reflect values that fall into the second half
@@ -450,7 +533,7 @@ class Align(cpm.Module):
         return j, i
 
     def align_mutual_information(self, pixels1, pixels2, mask1, mask2):
-        '''Align the second image with the first using mutual information
+        """Align the second image with the first using mutual information
 
         returns the x,y offsets to add to image1's indexes to align it with
         image2
@@ -460,7 +543,7 @@ class Align(cpm.Module):
         then picks the direction in which there is the most mutual information.
         From there, it tries all offsets again and so on until it reaches
         a local maximum.
-        '''
+        """
         #
         # TODO: Possibly use all 3 dimensions for color some day
         #
@@ -500,9 +583,10 @@ class Align(cpm.Module):
             if i == last_i and j == last_j:
                 return j, i
 
-    def apply_alignment(self, workspace, input_image_name, output_image_name,
-                        off_x, off_y, shape):
-        '''Apply an alignment to the input image to result in the output image
+    def apply_alignment(
+        self, workspace, input_image_name, output_image_name, off_x, off_y, shape
+    ):
+        """Apply an alignment to the input image to result in the output image
 
         workspace - image set's workspace passed to run
 
@@ -510,10 +594,10 @@ class Align(cpm.Module):
 
         output_image_name - name of the resultant image
 
-        off_x, off_y - offset of the resultant image relative to the origninal
+        off_x, off_y - offset of the resultant image relative to the original
 
         shape - shape of the resultant image
-        '''
+        """
 
         image = workspace.image_set.get_image(input_image_name)
         pixel_data = image.pixel_data
@@ -542,14 +626,13 @@ class Align(cpm.Module):
         p1[:, :] = True
         if np.all(crop_mask):
             crop_mask = None
-        output_image = cpi.Image(output_pixels,
-                                 mask=output_mask,
-                                 crop_mask=crop_mask,
-                                 parent_image=image)
+        output_image = cpi.Image(
+            output_pixels, mask=output_mask, crop_mask=crop_mask, parent_image=image
+        )
         workspace.image_set.add(output_image_name, output_image)
 
     def adjust_offsets(self, offsets, shapes):
-        '''Adjust the offsets and shapes for output
+        """Adjust the offsets and shapes for output
 
         workspace - workspace passed to "run"
 
@@ -561,7 +644,7 @@ class Align(cpm.Module):
 
         Based on the crop mode, adjust the offsets and shapes to optimize
         the cropping.
-        '''
+        """
         offsets = np.array(offsets)
         shapes = np.array(shapes)
         if self.crop_mode == C_CROP:
@@ -608,30 +691,33 @@ class Align(cpm.Module):
 
     def get_measurement_images(self, pipeline, object_name, category, measurement):
         if measurement in self.get_measurements(pipeline, object_name, category):
-            return ([self.first_output_image.value,
-                     self.second_output_image.value] +
-                    [additional.output_image_name.value
-                     for additional in self.additional_images])
+            return [self.first_output_image.value, self.second_output_image.value] + [
+                additional.output_image_name.value
+                for additional in self.additional_images
+            ]
         return []
 
     def get_measurement_columns(self, pipeline):
-        '''return the offset measurements'''
+        """return the offset measurements"""
 
-        targets = ([self.first_output_image.value,
-                    self.second_output_image.value] +
-                   [additional.output_image_name.value
-                    for additional in self.additional_images])
+        targets = [self.first_output_image.value, self.second_output_image.value] + [
+            additional.output_image_name.value for additional in self.additional_images
+        ]
         columns = []
-        for axis in ('X', 'Y'):
-            columns += [(cpmeas.IMAGE,
-                         MEASUREMENT_FORMAT % (axis, target),
-                         cpmeas.COLTYPE_INTEGER)
-                        for target in targets]
+        for axis in ("X", "Y"):
+            columns += [
+                (
+                    cpmeas.IMAGE,
+                    MEASUREMENT_FORMAT % (axis, target),
+                    cpmeas.COLTYPE_INTEGER,
+                )
+                for target in targets
+            ]
         return columns
 
-    def upgrade_settings(self, setting_values,
-                         variable_revision_number,
-                         module_name, from_matlab):
+    def upgrade_settings(
+        self, setting_values, variable_revision_number, module_name, from_matlab
+    ):
         if from_matlab and variable_revision_number == 4:
             #
             # The Matlab align module has the following layout
@@ -647,16 +733,25 @@ class Align(cpm.Module):
             # 9:  AlternateImage2
             # 10: AlternateAlignedImage2
             new_setting_values = list(setting_values[:4])
-            if (setting_values[4] != cps.DO_NOT_USE and
-                        setting_values[5] != cps.DO_NOT_USE):
-                new_setting_values += [setting_values[4], setting_values[5],
-                                       A_SEPARATELY]
+            if (
+                setting_values[4] != cps.DO_NOT_USE
+                and setting_values[5] != cps.DO_NOT_USE
+            ):
+                new_setting_values += [
+                    setting_values[4],
+                    setting_values[5],
+                    A_SEPARATELY,
+                ]
             for i in (7, 9):
-                if (setting_values[i] != cps.DO_NOT_USE and
-                            setting_values[i + 1] != cps.DO_NOT_USE):
-                    new_setting_values += [setting_values[i],
-                                           setting_values[i + 1],
-                                           A_SIMILARLY]
+                if (
+                    setting_values[i] != cps.DO_NOT_USE
+                    and setting_values[i + 1] != cps.DO_NOT_USE
+                ):
+                    new_setting_values += [
+                        setting_values[i],
+                        setting_values[i + 1],
+                        A_SIMILARLY,
+                    ]
             new_setting_values += [setting_values[6], True]
             setting_values = new_setting_values
             from_matlab = False
@@ -677,16 +772,25 @@ class Align(cpm.Module):
             # 10: AlternateAlignedImage2
             # 11: Wants cropping.
             new_setting_values = list(setting_values[:4])
-            if (setting_values[4] != cps.DO_NOT_USE and
-                        setting_values[5] != cps.DO_NOT_USE):
-                new_setting_values += [setting_values[4], setting_values[5],
-                                       A_SEPARATELY]
+            if (
+                setting_values[4] != cps.DO_NOT_USE
+                and setting_values[5] != cps.DO_NOT_USE
+            ):
+                new_setting_values += [
+                    setting_values[4],
+                    setting_values[5],
+                    A_SEPARATELY,
+                ]
             for i in (7, 9):
-                if (setting_values[i] != cps.DO_NOT_USE and
-                            setting_values[i + 1] != cps.DO_NOT_USE):
-                    new_setting_values += [setting_values[i],
-                                           setting_values[i + 1],
-                                           A_SIMILARLY]
+                if (
+                    setting_values[i] != cps.DO_NOT_USE
+                    and setting_values[i + 1] != cps.DO_NOT_USE
+                ):
+                    new_setting_values += [
+                        setting_values[i],
+                        setting_values[i + 1],
+                        A_SIMILARLY,
+                    ]
             new_setting_values += [setting_values[6], setting_values[11]]
             setting_values = new_setting_values
             from_matlab = False
@@ -711,16 +815,25 @@ class Align(cpm.Module):
             # 14: MoreAlignedImageName4
             # 15: Wants cropping.
             new_setting_values = list(setting_values[:4])
-            if (setting_values[4] != cps.DO_NOT_USE and
-                        setting_values[5] != cps.DO_NOT_USE):
-                new_setting_values += [setting_values[4], setting_values[5],
-                                       A_SEPARATELY]
+            if (
+                setting_values[4] != cps.DO_NOT_USE
+                and setting_values[5] != cps.DO_NOT_USE
+            ):
+                new_setting_values += [
+                    setting_values[4],
+                    setting_values[5],
+                    A_SEPARATELY,
+                ]
             for i in (7, 9, 11, 13):
-                if (setting_values[i] != cps.DO_NOT_USE and
-                            setting_values[i + 1] != cps.DO_NOT_USE):
-                    new_setting_values += [setting_values[i],
-                                           setting_values[i + 1],
-                                           A_SIMILARLY]
+                if (
+                    setting_values[i] != cps.DO_NOT_USE
+                    and setting_values[i + 1] != cps.DO_NOT_USE
+                ):
+                    new_setting_values += [
+                        setting_values[i],
+                        setting_values[i + 1],
+                        A_SIMILARLY,
+                    ]
             new_setting_values += [setting_values[6], setting_values[11]]
             setting_values = new_setting_values
             from_matlab = False
@@ -728,25 +841,26 @@ class Align(cpm.Module):
 
         if (not from_matlab) and variable_revision_number == 1:
             # Moved final settings (alignment method, cropping) to the top
-            setting_values = (setting_values[-2:] + setting_values[:-2])
+            setting_values = setting_values[-2:] + setting_values[:-2]
             variable_revision_number = 2
 
         if (not from_matlab) and variable_revision_number == 2:
             # wants_cropping changed to crop_mode
             setting_values = (
-                setting_values[:1] +
-                [C_CROP if setting_values[1] == cps.YES else C_SAME_SIZE] +
-                setting_values[2:])
+                setting_values[:1]
+                + [C_CROP if setting_values[1] == cps.YES else C_SAME_SIZE]
+                + setting_values[2:]
+            )
             variable_revision_number = 3
 
         return setting_values, variable_revision_number, from_matlab
 
 
 def offset_slice(pixels1, pixels2, i, j):
-    '''Return two sliced arrays where the first slice is offset by i,j
+    """Return two sliced arrays where the first slice is offset by i,j
     relative to the second slice.
 
-    '''
+    """
     if i < 0:
         height = min(pixels1.shape[0] + i, pixels2.shape[0])
         p1_imin = -i
@@ -774,12 +888,12 @@ def offset_slice(pixels1, pixels2, i, j):
 
 
 def cumsum_quadrant(x, i_forwards, j_forwards):
-    '''Return the cumulative sum going in the i, then j direction
+    """Return the cumulative sum going in the i, then j direction
 
     x - the matrix to be summed
     i_forwards - sum from 0 to end in the i direction if true
     j_forwards - sum from 0 to end in the j direction if true
-    '''
+    """
     if i_forwards:
         x = x.cumsum(0)
     else:
@@ -791,7 +905,7 @@ def cumsum_quadrant(x, i_forwards, j_forwards):
 
 
 def entropy(x):
-    '''The entropy of x as if x is a probability distribution'''
+    """The entropy of x as if x is a probability distribution"""
     histogram = scind.histogram(x.astype(float), np.min(x), np.max(x), 256)
     n = np.sum(histogram)
     if n > 0 and np.max(histogram) > 0:
@@ -802,7 +916,7 @@ def entropy(x):
 
 
 def entropy2(x, y):
-    '''Joint entropy of paired samples X and Y'''
+    """Joint entropy of paired samples X and Y"""
     #
     # Bin each image into 256 gray levels
     #
@@ -814,8 +928,9 @@ def entropy2(x, y):
     #
     xy = 256 * x + y
     xy = xy.flatten()
-    sparse = scipy.sparse.coo_matrix((np.ones(xy.shape),
-                                      (xy, np.zeros(xy.shape))))
+    sparse = scipy.sparse.coo_matrix(
+        (np.ones(xy.shape, dtype=np.int32), (xy, np.zeros(xy.shape, dtype=np.int32)))
+    )
     histogram = sparse.toarray()
     n = np.sum(histogram)
     if n > 0 and np.max(histogram) > 0:
@@ -826,10 +941,10 @@ def entropy2(x, y):
 
 
 def reshape_image(source, new_shape):
-    '''Reshape an image to a larger shape, padding with zeros'''
+    """Reshape an image to a larger shape, padding with zeros"""
     if tuple(source.shape) == tuple(new_shape):
         return source
 
     result = np.zeros(new_shape, source.dtype)
-    result[:source.shape[0], :source.shape[1]] = source
+    result[: source.shape[0], : source.shape[1]] = source
     return result

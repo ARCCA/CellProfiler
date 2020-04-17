@@ -1,29 +1,46 @@
+import json
+import logging
+import logging.config
+import optparse
+import os
+import os.path
+import re
+import sys
+import tempfile
+from urllib.parse import urlparse
+
 import bioformats.formatreader
-import ctypes
+import h5py
+import matplotlib
+import numpy
+import pkg_resources
+import six.moves
+
+import cellprofiler
 import cellprofiler.measurement
 import cellprofiler.object
 import cellprofiler.pipeline
 import cellprofiler.preferences
 import cellprofiler.utilities.cpjvm
 import cellprofiler.utilities.hdf5_dict
-import cellprofiler.utilities.version
 import cellprofiler.utilities.zmqrequest
 import cellprofiler.worker
 import cellprofiler.workspace
-import cStringIO
-import h5py
-import json
-import logging
-import logging.config
-import matplotlib
-import numpy
-import optparse
-import os
-import pkg_resources
-import re
-import site
-import sys
-import tempfile
+
+if sys.platform.startswith("win") and hasattr(sys, "frozen"):
+    # For Windows builds, use built-in Java for CellProfiler, otherwise try to use Java from elsewhere on the system.
+    # Users can use a custom java installation by removing CP_JAVA_HOME.
+    # JAVA_HOME must be set before bioformats import.
+    try:
+        if "CP_JAVA_HOME" in os.environ:
+            os.environ["JAVA_HOME"] = os.environ["CP_JAVA_HOME"]
+        assert "JAVA_HOME" in os.environ
+    except AssertionError:
+        print("CellProfiler Startup ERROR: Could not find path to Java environment directory.\n"
+              "Please set the CP_JAVA_HOME system environment variable.\n"
+              "Visit http://broad.io/cpjava for instructions.")
+        os.system("pause")  # Keep console window open until keypress.
+        os._exit(1)
 
 OMERO_CK_HOST = "host"
 OMERO_CK_PORT = "port"
@@ -32,7 +49,7 @@ OMERO_CK_PASSWORD = "password"
 OMERO_CK_SESSION_ID = "session-id"
 OMERO_CK_CONFIG_FILE = "config-file"
 
-numpy.seterr(all='ignore')
+numpy.seterr(all="ignore")
 
 
 def main(args=None):
@@ -40,7 +57,7 @@ def main(args=None):
 
     """Run CellProfiler
 
-    args - command-line arguments, e.g. sys.argv
+    args - command-line arguments, e.g., sys.argv
     """
     if args is None:
         args = sys.argv
@@ -49,19 +66,58 @@ def main(args=None):
 
     exit_code = 0
 
-    switches = ('--work-announce', '--knime-bridge-address')
+    switches = ("--work-announce", "--knime-bridge-address")
 
     if any([any([arg.startswith(switch) for switch in switches]) for arg in args]):
         cellprofiler.preferences.set_headless()
-
         cellprofiler.worker.aw_parse_args()
-
         cellprofiler.worker.main()
-
-        sys.exit(exit_code)
+        return exit_code
 
     options, args = parse_args(args)
+    
+    if options.temp_dir is not None:
+        if not os.path.exists(options.temp_dir):
+            os.makedirs(options.temp_dir)
+        cellprofiler.preferences.set_temporary_directory(
+            options.temp_dir, globally=False
+        )
 
+    to_clean = []
+    
+    if options.pipeline_filename:
+        o = urlparse(options.pipeline_filename)
+        if o[0] in ("ftp", "http", "https"):
+            import urllib2
+            temp_pipe_file = tempfile.NamedTemporaryFile(mode='w+b',suffix='.cppipe',dir=temp_dir,delete=False)
+            downloaded_pipeline = urllib2.urlopen(options.pipeline_filename)
+            for line in downloaded_pipeline:
+                temp_pipe_file.write(line)
+            options.pipeline_filename = temp_pipe_file.name
+            to_clean.append(os.path.join(temp_dir, temp_pipe_file.name))
+    
+    if options.image_set_file:
+        o = urlparse(options.image_set_file)
+        if o[0] in ("ftp", "http", "https"):
+            import urllib2
+            temp_set_file = tempfile.NamedTemporaryFile(mode='w+b',suffix='.csv',dir=temp_dir,delete=False)
+            downloaded_set_csv = urllib2.urlopen(options.image_set_file)
+            for line in downloaded_set_csv:
+                temp_set_file.write(line)
+            options.image_set_file = temp_set_file.name
+            to_clean.append(os.path.join(temp_dir, temp_set_file.name))
+    
+    if options.data_file:
+        o = urlparse(options.data_file)
+        if o[0] in ("ftp", "http", "https"):
+            import urllib2
+            temp_data_file = tempfile.NamedTemporaryFile(mode='w+b',suffix='.csv',dir=temp_dir,delete=False)
+            downloaded_data_csv = urllib2.urlopen(options.data_file)
+            for line in downloaded_data_csv:
+                temp_data_file.write(line)
+            options.data_file = temp_data_file.name
+            to_clean.append(os.path.join(temp_dir, temp_data_file.name))
+    
     if options.print_version:
         __version__(exit_code)
 
@@ -70,24 +126,33 @@ def main(args=None):
 
         options.run_pipeline = True
 
+    if options.batch_commands_file:
+        cellprofiler.preferences.set_headless()
+        options.run_pipeline = False
+        options.show_gui = False
+
     set_log_level(options)
 
     if options.print_groups_file is not None:
         print_groups(options.print_groups_file)
 
     if options.batch_commands_file is not None:
-        get_batch_commands(options.batch_commands_file)
+        try:
+            nr_per_batch = int(options.images_per_batch)
+        except ValueError:
+            logging.warning(
+                "non-integer argument to --images-per-batch. Defaulting to 1."
+            )
+            nr_per_batch = 1
+        get_batch_commands(options.batch_commands_file, nr_per_batch)
 
     if options.omero_credentials is not None:
         set_omero_credentials_from_string(options.omero_credentials)
 
     if options.plugins_directory is not None:
-        cellprofiler.preferences.set_plugin_directory(options.plugins_directory, globally=False)
-
-    if options.temp_dir is not None:
-        if not os.path.exists(options.temp_dir):
-            os.makedirs(options.temp_dir)
-        cellprofiler.preferences.set_temporary_directory(options.temp_dir, globally=False)
+        cellprofiler.preferences.set_plugin_directory(
+            options.plugins_directory, globally=False
+        )
 
     if not options.allow_schema_write:
         cellprofiler.preferences.set_allow_schema_write(False)
@@ -107,51 +172,65 @@ def main(args=None):
     if options.data_file is not None:
         cellprofiler.preferences.set_data_file(os.path.abspath(options.data_file))
 
-    cellprofiler.utilities.cpjvm.cp_start_vm()
+    try:
+        if not options.show_gui:
+            cellprofiler.utilities.cpjvm.cp_start_vm()
 
-    if options.image_set_file is not None:
-        cellprofiler.preferences.set_image_set_file(options.image_set_file)
+        if options.image_set_file is not None:
+            cellprofiler.preferences.set_image_set_file(options.image_set_file)
 
-    #
-    # Handle command-line tasks that that need to load the modules to run
-    #
-    if options.print_measurements:
-        print_measurements(options)
+        #
+        # Handle command-line tasks that that need to load the modules to run
+        #
+        if options.print_measurements:
+            print_measurements(options)
 
-    if options.write_schema_and_exit:
-        write_schema(options.pipeline_filename)
+        if options.write_schema_and_exit:
+            write_schema(options.pipeline_filename)
 
-    if options.show_gui:
-        matplotlib.use('WXAgg')
+        if options.show_gui:
+            matplotlib.use("WXAgg")
 
-        import cellprofiler.gui.app
+            import cellprofiler.gui.app
 
-        if options.pipeline_filename:
-            if cellprofiler.workspace.is_workspace_file(options.pipeline_filename):
-                workspace_path = os.path.expanduser(options.pipeline_filename)
+            if options.pipeline_filename:
+                if cellprofiler.workspace.is_workspace_file(options.pipeline_filename):
+                    workspace_path = os.path.expanduser(options.pipeline_filename)
+
+                    pipeline_path = None
+                else:
+                    pipeline_path = os.path.expanduser(options.pipeline_filename)
+
+                    workspace_path = None
+            else:
+                workspace_path = None
 
                 pipeline_path = None
-            else:
-                pipeline_path = os.path.expanduser(options.pipeline_filename)
 
-                workspace_path = None
-        else:
-            workspace_path = None
+            app = cellprofiler.gui.app.App(
+                0, workspace_path=workspace_path, pipeline_path=pipeline_path
+            )
 
-            pipeline_path = None
+            if options.run_pipeline:
+                app.frame.pipeline_controller.do_analyze_images()
 
-        app = cellprofiler.gui.app.App(0, workspace_path=workspace_path, pipeline_path=pipeline_path)
+            app.MainLoop()
 
-        if options.run_pipeline:
-            app.frame.pipeline_controller.do_analyze_images()
+            return
+        elif options.run_pipeline:
+            exit_code = run_pipeline_headless(options, args)
 
-        app.MainLoop()
+    finally:
+        # Cleanup the temp files we made, if any
+        if len(to_clean) > 0:
+            for each_temp in to_clean:
+                os.remove(each_temp)
+        # If anything goes wrong during the startup sequence headlessly, the JVM needs
+        # to be explicitly closed
+        if not options.show_gui:
+            stop_cellprofiler()
 
-        return
-    elif options.run_pipeline:
-        run_pipeline_headless(options, args)
-
-    stop_cellprofiler()
+    return exit_code
 
 
 def __version__(exit_code):
@@ -162,6 +241,12 @@ def __version__(exit_code):
 
 def stop_cellprofiler():
     cellprofiler.utilities.zmqrequest.join_to_the_boundary()
+
+    # Bioformats readers have to be properly closed.
+    # This is especially important when using OmeroReaders as leaving the
+    # readers open leaves the OMERO.server services open which in turn leads to
+    # high memory consumption.
+    bioformats.formatreader.clear_image_reader_cache()
 
     cellprofiler.utilities.cpjvm.cp_stop_vm()
 
@@ -185,13 +270,13 @@ def parse_args(args):
         "--pipeline",
         "--project",
         dest="pipeline_filename",
-        help='Load this pipeline file or project on startup. If specifying a pipeline file rather than a project, the -i flag is also needed unless the pipeline is saved with the file list.',
-        default=None
+        help="Load this pipeline file or project on startup. If specifying a pipeline file rather than a project, the -i flag is also needed unless the pipeline is saved with the file list.",
+        default=None,
     )
 
     default_show_gui = True
 
-    if sys.platform.startswith('linux') and not os.getenv('DISPLAY'):
+    if sys.platform.startswith("linux") and not os.getenv("DISPLAY"):
         default_show_gui = False
 
     parser.add_option(
@@ -200,7 +285,7 @@ def parse_args(args):
         action="store_false",
         dest="show_gui",
         default=default_show_gui,
-        help="Run headless (without the GUI)"
+        help="Run headless (without the GUI)",
     )
 
     parser.add_option(
@@ -209,7 +294,7 @@ def parse_args(args):
         action="store_true",
         dest="run_pipeline",
         default=False,
-        help="Run the given pipeline on startup"
+        help="Run the given pipeline on startup",
     )
 
     parser.add_option(
@@ -217,7 +302,7 @@ def parse_args(args):
         "--output-directory",
         dest="output_directory",
         default=None,
-        help="Make this directory the default output folder"
+        help="Make this directory the default output folder",
     )
 
     parser.add_option(
@@ -225,7 +310,7 @@ def parse_args(args):
         "--image-directory",
         dest="image_directory",
         default=None,
-        help="Make this directory the default input folder"
+        help="Make this directory the default input folder",
     )
 
     parser.add_option(
@@ -233,7 +318,7 @@ def parse_args(args):
         "--first-image-set",
         dest="first_image_set",
         default=None,
-        help="The one-based index of the first image set to process"
+        help="The one-based index of the first image set to process",
     )
 
     parser.add_option(
@@ -241,7 +326,7 @@ def parse_args(args):
         "--last-image-set",
         dest="last_image_set",
         default=None,
-        help="The one-based index of the last image set to process"
+        help="The one-based index of the last image set to process",
     )
 
     parser.add_option(
@@ -249,13 +334,13 @@ def parse_args(args):
         "--group",
         dest="groups",
         default=None,
-        help='Restrict processing to one grouping in a grouped pipeline. For instance, "-g ROW=H,COL=01", will process only the group of image sets that match the keys.'
+        help='Restrict processing to one grouping in a grouped pipeline. For instance, "-g ROW=H,COL=01", will process only the group of image sets that match the keys.',
     )
 
     parser.add_option(
         "--plugins-directory",
         dest="plugins_directory",
-        help="CellProfiler will look for plugin modules in this directory (headless-only)."
+        help="CellProfiler will look for plugin modules in this directory (headless-only).",
     )
 
     parser.add_option(
@@ -263,23 +348,28 @@ def parse_args(args):
         dest="print_version",
         default=False,
         action="store_true",
-        help="Print the version and exit"
+        help="Print the version and exit",
     )
 
-    parser.add_option("-t", "--temporary-directory",
-                      dest="temp_dir",
-                      default=None,
-                      help=("Temporary directory. "
-                            "CellProfiler uses this for downloaded image files "
-                            "and for the measurements file, if not specified. "
-                            "The default is " + tempfile.gettempdir()))
+    parser.add_option(
+        "-t",
+        "--temporary-directory",
+        dest="temp_dir",
+        default=None,
+        help=(
+            "Temporary directory. "
+            "CellProfiler uses this for downloaded image files "
+            "and for the measurements file, if not specified. "
+            "The default is " + tempfile.gettempdir()
+        ),
+    )
 
     parser.add_option(
         "-d",
         "--done-file",
         dest="done_file",
         default=None,
-        help='The path to the "Done" file, written by CellProfiler shortly before exiting'
+        help='The path to the "Done" file, written by CellProfiler shortly before exiting',
     )
 
     parser.add_option(
@@ -287,48 +377,59 @@ def parse_args(args):
         dest="print_measurements",
         default=False,
         action="store_true",
-        help="Open the pipeline file specified by the -p switch and print the measurements made by that pipeline")
+        help="Open the pipeline file specified by the -p switch and print the measurements made by that pipeline",
+    )
 
     parser.add_option(
         "--print-groups",
         dest="print_groups_file",
         default=None,
-        help="Open the measurements file following the --print-groups switch and print the groups in its image sets. The measurements file should be generated using CreateBatchFiles. The output is a JSON-encoded data structure containing the group keys and values and the image sets in each group.")
+        help="Open the measurements file following the --print-groups switch and print the groups in its image sets. The measurements file should be generated using CreateBatchFiles. The output is a JSON-encoded data structure containing the group keys and values and the image sets in each group.",
+    )
 
     parser.add_option(
         "--get-batch-commands",
         dest="batch_commands_file",
         default=None,
-        help='Open the measurements file following the --get-batch-commands switch and print one line to the console per group. The measurements file should be generated using CreateBatchFiles and the image sets should be grouped into the units to be run. Each line is a command to invoke CellProfiler. You can use this option to generate a shell script that will invoke CellProfiler on a cluster by substituting "CellProfiler" ' "with your invocation command in the script's text, for instance: CellProfiler --get-batch-commands Batch_data.h5 | sed s/CellProfiler/farm_jobs.sh")
+        help='Open the measurements file following the --get-batch-commands switch and print one line to the console per group. The measurements file should be generated using CreateBatchFiles and the image sets should be grouped into the units to be run. Each line is a command to invoke CellProfiler. You can use this option to generate a shell script that will invoke CellProfiler on a cluster by substituting "CellProfiler" '
+        "with your invocation command in the script's text, for instance: CellProfiler --get-batch-commands Batch_data.h5 | sed s/CellProfiler/farm_jobs.sh. Note that CellProfiler will always run in headless mode when --get-batch-commands is present and will exit after generating the batch commands without processing any pipeline.",
+    )
+
+    parser.add_option(
+        "--images-per-batch",
+        dest="images_per_batch",
+        default="1",
+        help="For pipelines that do not use image grouping this option specifies the number of images that should be processed in each batch if --get-batch-commands is used. Defaults to 1.",
+    )
 
     parser.add_option(
         "--data-file",
         dest="data_file",
         default=None,
-        help="Specify the location of a .csv file for LoadData. If this switch is present, this file is used instead of the one specified in the LoadData module."
+        help="Specify the location of a .csv file for LoadData. If this switch is present, this file is used instead of the one specified in the LoadData module.",
     )
 
     parser.add_option(
         "--file-list",
         dest="image_set_file",
         default=None,
-        help="Specify a file list of one file or URL per line to be used to initially populate the Images module's file list."
+        help="Specify a file list of one file or URL per line to be used to initially populate the Images module's file list.",
     )
 
     parser.add_option(
         "--do-not-write-schema",
-        dest='allow_schema_write',
+        dest="allow_schema_write",
         default=True,
         action="store_false",
-        help="Do not execute the schema definition and other per-experiment SQL commands during initialization when running a pipeline in batch mode."
+        help="Do not execute the schema definition and other per-experiment SQL commands during initialization when running a pipeline in batch mode.",
     )
 
     parser.add_option(
         "--write-schema-and-exit",
-        dest='write_schema_and_exit',
+        dest="write_schema_and_exit",
         default=False,
-        action='store_true',
-        help="Create the experiment database schema and exit"
+        action="store_true",
+        help="Create the experiment database schema and exit",
     )
 
     parser.add_option(
@@ -336,17 +437,18 @@ def parse_args(args):
         dest="omero_credentials",
         default=None,
         help=(
-                 "Enter login credentials for OMERO. The credentials"
-                 " are entered as comma-separated key/value pairs with"
-                 " keys, \"%(OMERO_CK_HOST)s\" - the DNS host name for the OMERO server"
-                 ", \"%(OMERO_CK_PORT)s\" - the server's port # (typically 4064)"
-                 ", \"%(OMERO_CK_USER)s\" - the name of the connecting user"
-                 ", \"%(OMERO_CK_PASSWORD)s\" - the connecting user's password"
-                 ", \"%(OMERO_CK_SESSION_ID)s\" - the session ID for an OMERO client session."
-                 ", \"%(OMERO_CK_CONFIG_FILE)s\" - the path to the OMERO credentials config file."
-                 " A typical set of credentials might be:"
-                 " --omero-credentials host=demo.openmicroscopy.org,port=4064,session-id=atrvomvjcjfe7t01e8eu59amixmqqkfp"
-             ) % globals()
+            "Enter login credentials for OMERO. The credentials"
+            " are entered as comma-separated key/value pairs with"
+            ' keys, "%(OMERO_CK_HOST)s" - the DNS host name for the OMERO server'
+            ', "%(OMERO_CK_PORT)s" - the server\'s port # (typically 4064)'
+            ', "%(OMERO_CK_USER)s" - the name of the connecting user'
+            ', "%(OMERO_CK_PASSWORD)s" - the connecting user\'s password'
+            ', "%(OMERO_CK_SESSION_ID)s" - the session ID for an OMERO client session.'
+            ', "%(OMERO_CK_CONFIG_FILE)s" - the path to the OMERO credentials config file.'
+            " A typical set of credentials might be:"
+            " --omero-credentials host=demo.openmicroscopy.org,port=4064,session-id=atrvomvjcjfe7t01e8eu59amixmqqkfp"
+        )
+        % globals(),
     )
 
     parser.add_option(
@@ -355,19 +457,20 @@ def parse_args(args):
         dest="log_level",
         default=str(logging.INFO),
         help=(
-            "Set the verbosity for logging messages: " +
-            ("%d or %s for debugging, " % (logging.DEBUG, "DEBUG")) +
-            ("%d or %s for informational, " % (logging.INFO, "INFO")) +
-            ("%d or %s for warning, " % (logging.WARNING, "WARNING")) +
-            ("%d or %s for error, " % (logging.ERROR, "ERROR")) +
-            ("%d or %s for critical, " % (logging.CRITICAL, "CRITICAL")) +
-            ("%d or %s for fatal." % (logging.FATAL, "FATAL")) +
-            " Otherwise, the argument is interpreted as the file name of a log configuration file (see http://docs.python.org/library/logging.config.html for file format)")
+            "Set the verbosity for logging messages: "
+            + ("%d or %s for debugging, " % (logging.DEBUG, "DEBUG"))
+            + ("%d or %s for informational, " % (logging.INFO, "INFO"))
+            + ("%d or %s for warning, " % (logging.WARNING, "WARNING"))
+            + ("%d or %s for error, " % (logging.ERROR, "ERROR"))
+            + ("%d or %s for critical, " % (logging.CRITICAL, "CRITICAL"))
+            + ("%d or %s for fatal." % (logging.FATAL, "FATAL"))
+            + " Otherwise, the argument is interpreted as the file name of a log configuration file (see http://docs.python.org/library/logging.config.html for file format)"
+        ),
     )
 
     options, result_args = parser.parse_args(args[1:])
 
-    if sys.platform == 'darwin' and len(args) == 2:
+    if sys.platform == "darwin" and len(args) == 2:
         if args[1].lower().endswith(".cpproj"):
             # Assume fakey open of .cpproj and OS can't be configured to
             # add the switch as it can in Windows.
@@ -407,10 +510,14 @@ def set_omero_credentials_from_string(credentials_string):
                         session-id - the session ID used for authentication
     """
     if re.match("([^=^,]+=[^=^,]+,)*([^=^,]+=[^=^,]+)", credentials_string) is None:
-        logging.root.error('The OMERO credentials string, "%s", is badly-formatted.' % credentials_string)
+        logging.root.error(
+            'The OMERO credentials string, "%s", is badly-formatted.'
+            % credentials_string
+        )
 
         logging.root.error(
-            'It should have the form: "host=hostname.org,port=####,user=<user>,session-id=<session-id>\n')
+            'It should have the form: "host=hostname.org,port=####,user=<user>,session-id=<session-id>\n'
+        )
 
         raise ValueError("Invalid format for --omero-credentials")
 
@@ -423,7 +530,7 @@ def set_omero_credentials_from_string(credentials_string):
             bioformats.formatreader.K_OMERO_SERVER: cellprofiler.preferences.get_omero_server(),
             bioformats.formatreader.K_OMERO_PORT: cellprofiler.preferences.get_omero_port(),
             bioformats.formatreader.K_OMERO_USER: cellprofiler.preferences.get_omero_user(),
-            bioformats.formatreader.K_OMERO_SESSION_ID: cellprofiler.preferences.get_omero_session_id()
+            bioformats.formatreader.K_OMERO_SESSION_ID: cellprofiler.preferences.get_omero_session_id(),
         }
 
         if k == OMERO_CK_HOST:
@@ -454,7 +561,10 @@ def set_omero_credentials_from_string(credentials_string):
         else:
             logging.root.error('Unknown --omero-credentials keyword: "%s"' % k)
 
-            logging.root.error('Acceptable keywords are: "%s"' % '","'.join([OMERO_CK_HOST, OMERO_CK_PORT, OMERO_CK_SESSION_ID]))
+            logging.root.error(
+                'Acceptable keywords are: "%s"'
+                % '","'.join([OMERO_CK_HOST, OMERO_CK_PORT, OMERO_CK_SESSION_ID])
+            )
 
             raise ValueError("Invalid format for --omero-credentials")
 
@@ -490,16 +600,16 @@ def print_measurements(options):
 
     columns = pipeline.get_measurement_columns()
 
-    print "--- begin measurements ---"
+    print("--- begin measurements ---")
 
-    print "Object,Feature,Type"
+    print("Object,Feature,Type")
 
     for column in columns:
         object_name, feature, data_type = column[:3]
 
-        print "%s,%s,%s" % (object_name, feature, data_type)
+        print("%s,%s,%s" % (object_name, feature, data_type))
 
-    print "--- end measurements ---"
+    print("--- end measurements ---")
 
 
 def print_groups(filename):
@@ -522,7 +632,7 @@ def print_groups(filename):
     json.dump(groupings, sys.stdout)
 
 
-def get_batch_commands(filename):
+def get_batch_commands(filename, n_per_job=1):
     """Print the commands needed to run the given batch data file headless
 
     filename - the name of a Batch_data.h5 file. The file should group image sets.
@@ -539,13 +649,25 @@ def get_batch_commands(filename):
 
     image_numbers = m.get_image_numbers()
 
-    if m.has_feature(cellprofiler.measurement.IMAGE, cellprofiler.measurement.GROUP_NUMBER):
-        group_numbers = m[cellprofiler.measurement.IMAGE, cellprofiler.measurement.GROUP_NUMBER, image_numbers]
+    if m.has_feature(
+        cellprofiler.measurement.IMAGE, cellprofiler.measurement.GROUP_NUMBER
+    ):
+        group_numbers = m[
+            cellprofiler.measurement.IMAGE,
+            cellprofiler.measurement.GROUP_NUMBER,
+            image_numbers,
+        ]
 
-        group_indexes = m[cellprofiler.measurement.IMAGE, cellprofiler.measurement.GROUP_INDEX, image_numbers]
+        group_indexes = m[
+            cellprofiler.measurement.IMAGE,
+            cellprofiler.measurement.GROUP_INDEX,
+            image_numbers,
+        ]
 
-        if numpy.any(group_numbers != 1) and numpy.all((group_indexes[1:] == group_indexes[:-1] + 1) | (
-            (group_indexes[1:] == 1) & (group_numbers[1:] == group_numbers[:-1] + 1))):
+        if numpy.any(group_numbers != 1) and numpy.all(
+            (group_indexes[1:] == group_indexes[:-1] + 1)
+            | ((group_indexes[1:] == 1) & (group_numbers[1:] == group_numbers[:-1] + 1))
+        ):
             #
             # Do -f and -l if more than one group and group numbers
             # and indices are properly constructed
@@ -560,27 +682,38 @@ def get_batch_commands(filename):
                 if off == prev:
                     continue
 
-                print "CellProfiler -c -r -p %s -f %d -l %d" % (filename, prev + 1, off)
+                print(
+                    "CellProfiler -c -r -p %s -f %d -l %d" % (filename, prev + 1, off)
+                )
 
                 prev = off
+    else:
+        metadata_tags = m.get_grouping_tags()
 
-            return
+        if len(metadata_tags) == 1 and metadata_tags[0] == "ImageNumber":
+            for i in range(0, len(image_numbers), n_per_job):
+                first = image_numbers[i]
+                last = image_numbers[min(i + n_per_job - 1, len(image_numbers) - 1)]
+                print("CellProfiler -c -r -p %s -f %d -l %d" % (filename, first, last))
+        else:
+            # LoadData w/ images grouped by metadata tags
+            groupings = m.get_groupings(metadata_tags)
 
-    metadata_tags = m.get_grouping_tags()
+            for grouping in groupings:
+                group_string = ",".join(
+                    ["%s=%s" % (k, v) for k, v in list(grouping[0].items())]
+                )
 
-    groupings = m.get_groupings(metadata_tags)
-
-    for grouping in groupings:
-        group_string = ",".join(["%s=%s" % (k, v) for k, v in grouping[0].iteritems()])
-
-        print "CellProfiler -c -r -p %s -g %s" % (filename, group_string)
+                print("CellProfiler -c -r -p %s -g %s" % (filename, group_string))
+    return
 
 
 def write_schema(pipeline_filename):
     if pipeline_filename is None:
         raise ValueError(
             "The --write-schema-and-exit switch must be used in conjunction\nwith the -p or --pipeline switch to load a pipeline with an\n"
-            "ExportToDatabase module.")
+            "ExportToDatabase module."
+        )
 
     pipeline = cellprofiler.pipeline.Pipeline()
 
@@ -592,11 +725,16 @@ def write_schema(pipeline_filename):
         if module.module_name == "ExportToDatabase":
             break
     else:
-        raise ValueError("The pipeline, \"%s\", does not have an ExportToDatabase module" % pipeline_filename)
+        raise ValueError(
+            'The pipeline, "%s", does not have an ExportToDatabase module'
+            % pipeline_filename
+        )
 
     m = cellprofiler.measurement.Measurements()
 
-    workspace = cellprofiler.workspace.Workspace(pipeline, module, m, cellprofiler.object.ObjectSet, m, None)
+    workspace = cellprofiler.workspace.Workspace(
+        pipeline, module, m, cellprofiler.object.ObjectSet, m, None
+    )
 
     module.prepare_run(workspace)
 
@@ -605,7 +743,6 @@ def run_pipeline_headless(options, args):
     """
     Run a CellProfiler pipeline in headless mode
     """
-
     if options.first_image_set is not None:
         if not options.first_image_set.isdigit():
             raise ValueError("The --first-image-set option takes a numeric argument")
@@ -629,7 +766,9 @@ def run_pipeline_headless(options, args):
     else:
         image_set_end = None
 
-    if (options.pipeline_filename is not None) and (not options.pipeline_filename.lower().startswith('http')):
+    if (options.pipeline_filename is not None) and (
+        not options.pipeline_filename.lower().startswith("http")
+    ):
         options.pipeline_filename = os.path.expanduser(options.pipeline_filename)
 
     pipeline = cellprofiler.pipeline.Pipeline()
@@ -638,16 +777,20 @@ def run_pipeline_headless(options, args):
 
     try:
         if h5py.is_hdf5(options.pipeline_filename):
-            initial_measurements = cellprofiler.measurement.load_measurements(options.pipeline_filename, image_numbers=image_set_numbers)
+            initial_measurements = cellprofiler.measurement.load_measurements(
+                options.pipeline_filename, image_numbers=image_set_numbers
+            )
     except:
         logging.root.info("Failed to load measurements from pipeline")
 
     if initial_measurements is not None:
-        pipeline_text = initial_measurements.get_experiment_measurement(cellprofiler.pipeline.M_PIPELINE)
+        pipeline_text = initial_measurements.get_experiment_measurement(
+            cellprofiler.pipeline.M_PIPELINE
+        )
 
-        pipeline_text = pipeline_text.encode('us-ascii')
+        pipeline_text = pipeline_text
 
-        pipeline.load(cStringIO.StringIO(pipeline_text))
+        pipeline.load(six.moves.StringIO(pipeline_text))
 
         if not pipeline.in_batch_mode():
             #
@@ -656,12 +799,14 @@ def run_pipeline_headless(options, args):
 
             with h5py.File(options.pipeline_filename, "r") as src:
                 if cellprofiler.utilities.hdf5_dict.HDF5FileList.has_file_list(src):
-                    cellprofiler.utilities.hdf5_dict.HDF5FileList.copy(src, initial_measurements.hdf5_dict.hdf5_file)
+                    cellprofiler.utilities.hdf5_dict.HDF5FileList.copy(
+                        src, initial_measurements.hdf5_dict.hdf5_file
+                    )
     else:
         pipeline.load(options.pipeline_filename)
 
     if options.groups is not None:
-        kvs = [x.split('=') for x in options.groups.split(',')]
+        kvs = [x.split("=") for x in options.groups.split(",")]
 
         groups = dict(kvs)
     else:
@@ -671,21 +816,45 @@ def run_pipeline_headless(options, args):
 
     if file_list is not None:
         pipeline.read_file_list(file_list)
+    elif options.image_directory is not None:
+        pathnames = []
+
+        os.path.walk(
+            os.path.abspath(options.image_directory),
+            lambda pathnames, dirname, fnames: pathnames.append(
+                [
+                    os.path.join(dirname, fname)
+                    for fname in fnames
+                    if os.path.isfile(os.path.join(dirname, fname))
+                ]
+            ),
+            pathnames,
+        )
+
+        pathnames = sum(pathnames, [])
+
+        pipeline.add_pathnames_to_file_list(pathnames)
 
     #
     # Fixup CreateBatchFiles with any command-line input or output directories
     #
     if pipeline.in_batch_mode():
-        create_batch_files = [m for m in pipeline.modules() if m.is_create_batch_module()]
+        create_batch_files = [
+            m for m in pipeline.modules() if m.is_create_batch_module()
+        ]
 
         if len(create_batch_files) > 0:
             create_batch_files = create_batch_files[0]
 
             if options.output_directory is not None:
-                create_batch_files.custom_output_directory.value = options.output_directory
+                create_batch_files.custom_output_directory.value = (
+                    options.output_directory
+                )
 
             if options.image_directory is not None:
-                create_batch_files.default_image_directory.value = options.image_directory
+                create_batch_files.default_image_directory.value = (
+                    options.image_directory
+                )
 
     use_hdf5 = len(args) > 0 and not args[0].lower().endswith(".mat")
 
@@ -694,17 +863,21 @@ def run_pipeline_headless(options, args):
         image_set_end=image_set_end,
         grouping=groups,
         measurements_filename=None if not use_hdf5 else args[0],
-        initial_measurements=initial_measurements
+        initial_measurements=initial_measurements,
     )
 
     if len(args) > 0 and not use_hdf5:
         pipeline.save_measurements(args[0], measurements)
 
     if options.done_file is not None:
-        if measurements is not None and measurements.has_feature(cellprofiler.measurement.EXPERIMENT, cellprofiler.pipeline.EXIT_STATUS):
-            done_text = measurements.get_experiment_measurement(cellprofiler.pipeline.EXIT_STATUS)
+        if measurements is not None and measurements.has_feature(
+            cellprofiler.measurement.EXPERIMENT, cellprofiler.pipeline.EXIT_STATUS
+        ):
+            done_text = measurements.get_experiment_measurement(
+                cellprofiler.pipeline.EXIT_STATUS
+            )
 
-            exit_code = (0 if done_text == "Complete" else -1)
+            exit_code = 0 if done_text == "Complete" else -1
         else:
             done_text = "Failure"
 
@@ -713,6 +886,11 @@ def run_pipeline_headless(options, args):
         fd = open(options.done_file, "wt")
         fd.write("%s\n" % done_text)
         fd.close()
+    elif not measurements.has_feature(
+        cellprofiler.measurement.EXPERIMENT, cellprofiler.pipeline.EXIT_STATUS
+    ):
+        # The pipeline probably failed
+        exit_code = 1
     else:
         exit_code = 0
 
@@ -723,4 +901,4 @@ def run_pipeline_headless(options, args):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
